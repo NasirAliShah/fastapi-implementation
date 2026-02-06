@@ -39,7 +39,19 @@ async def create_user(user: User):
         return created_user
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-
+# Delete a user 
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: str):
+    """Delete a user by ID"""
+    try:
+        result = await user_collection.delete_one({"_id": ObjectId(user_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"message": "User deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting user: {str(e)}")
 
 @app.get("/users/")
 async def get_users():
