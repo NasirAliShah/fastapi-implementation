@@ -1,16 +1,22 @@
 from fastapi import FastAPI
-from app.routes import auth, users, todos
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_TYPE = os.getenv("DB_TYPE", "postgresql").lower()
+
+if DB_TYPE == "mongodb":
+    from app.routes import auth_mongodb as auth
+    from app.routes import users_mongodb as users
+    from app.routes import todos_mongodb as todos
+else:
+    from app.routes import auth, users, todos
 
 def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application.
-    
-    This is the app factory pattern - centralizes app creation and configuration.
-    Benefits:
-    - Testability: Create multiple app instances for testing
-    - Configuration: Different configs for dev/prod
-    - Modularity: Separate app creation from routes
-    - Reusability: Use same app in different contexts
+    Supports both MongoDB and PostgreSQL based on DB_TYPE environment variable.
     """
     
     app = FastAPI(
@@ -22,7 +28,7 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json"
     )
     
-    # Register routers
+    # Register routers based on database type
     app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(todos.router)
@@ -31,14 +37,19 @@ def create_app() -> FastAPI:
     @app.get("/")
     async def root():
         """Health check endpoint"""
-        return {"message": "MongoDB + FastAPI connected!"}
+        db_info = "PostgreSQL" if DB_TYPE == "postgresql" else "MongoDB"
+        return {
+            "message": f"FastAPI + {db_info} connected!",
+            "database": db_info
+        }
     
     # Startup event
     @app.on_event("startup")
     async def startup_event():
-        print("✓ Application started successfully")
-        print("✓ Database connected")
-        print("✓ Routes registered")
+        db_info = "PostgreSQL" if DB_TYPE == "postgresql" else "MongoDB"
+        print(f"✓ Application started successfully")
+        print(f"✓ Database: {db_info}")
+        print(f"✓ Routes registered")
     
     # Shutdown event
     @app.on_event("shutdown")

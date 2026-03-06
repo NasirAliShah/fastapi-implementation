@@ -1,35 +1,36 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, status
-from bson import ObjectId
-from datetime import datetime
-from app.database.collections import todos_collection
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, desc
 from app.core.security import get_current_user, TokenData
 from app.models.todo import TodoCreate, TodoUpdate, TodoResponse, TodoListResponse, TodoStatus
+from app.database.connection import get_db
+from app.database.models import Todo
 
 router = APIRouter(prefix="/todos", tags=["todos"])
 
 @router.post("/", response_model=TodoResponse, status_code=status.HTTP_201_CREATED)
 async def create_todo(
     todo_data: TodoCreate,
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Create a new todo for the authenticated user"""
     try:
-        todo_dict = {
-            "user_id": current_user.user_id,
-            "title": todo_data.title,
-            "description": todo_data.description,
-            "status": todo_data.status,
-            "priority": todo_data.priority,
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-            "is_deleted": False
-        }
+        new_todo = Todo(
+            user_id=int(current_user.user_id),
+            title=todo_data.title,
+            description=todo_data.description,
+            status=todo_data.status,
+            priority=todo_data.priority
+        )
         
-        result = await todos_collection.insert_one(todo_dict)
-        created_todo = await todos_collection.find_one({"_id": result.inserted_id})
+        db.add(new_todo)
+        await db.commit()
+        await db.refresh(new_todo)
         
-        return _format_todo(created_todo)
+        return new_todo
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating todo: {str(e)}")
 
 @router.get("/", response_model=TodoListResponse)
@@ -39,62 +40,72 @@ async def list_todos(
     priority: int = Query(None, ge=1, le=5, description="Filter by priority"),
     skip: int = Query(0, ge=0, description="Number of items to skip"),
     limit: int = Query(10, ge=1, le=100, description="Number of items to return"),
-    sort_by: str = Query("created_at", description="Sort by field (created_at, priority, status)")
+    sort_by: str = Query("created_at", description="Sort by field"),
+    db: AsyncSession = Depends(get_db)
 ):
     """Get todos for the authenticated user with filtering and pagination"""
     try:
-        query = {
-            "user_id": current_user.user_id,
-            "is_deleted": False
-        }
+        stmt = select(Todo).where(
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        )
         
         if status_filter:
-            query["status"] = status_filter
+            stmt = stmt.where(Todo.status == status_filter)
         if priority:
-            query["priority"] = priority
+            stmt = stmt.where(Todo.priority == priority)
         
-        sort_order = -1 if sort_by == "created_at" else 1
-        sort_field = sort_by if sort_by in ["created_at", "priority", "status"] else "created_at"
+        if sort_by == "created_at":
+            stmt = stmt.order_by(desc(Todo.created_at))
+        elif sort_by == "priority":
+            stmt = stmt.order_by(Todo.priority)
+        else:
+            stmt = stmt.order_by(desc(Todo.created_at))
         
-        total = await todos_collection.count_documents(query)
+        count_stmt = select(func.count(Todo.id)).where(
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        )
+        if status_filter:
+            count_stmt = count_stmt.where(Todo.status == status_filter)
+        if priority:
+            count_stmt = count_stmt.where(Todo.priority == priority)
         
-        todos = await todos_collection.find(query)\
-            .sort(sort_field, sort_order)\
-            .skip(skip)\
-            .limit(limit)\
-            .to_list(limit)
+        total_result = await db.execute(count_stmt)
+        total = total_result.scalar()
         
-        formatted_todos = [_format_todo(todo) for todo in todos]
+        result = await db.execute(stmt.offset(skip).limit(limit))
+        todos = result.scalars().all()
         
         return TodoListResponse(
             total=total,
             page=skip // limit + 1,
             page_size=limit,
-            items=formatted_todos
+            items=todos
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching todos: {str(e)}")
 
 @router.get("/{todo_id}", response_model=TodoResponse)
 async def get_todo(
-    todo_id: str,
-    current_user: TokenData = Depends(get_current_user)
+    todo_id: int,
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Get a specific todo by ID (must belong to authenticated user)"""
     try:
-        if not ObjectId.is_valid(todo_id):
-            raise HTTPException(status_code=400, detail="Invalid todo ID format")
-        
-        todo = await todos_collection.find_one({
-            "_id": ObjectId(todo_id),
-            "user_id": current_user.user_id,
-            "is_deleted": False
-        })
+        stmt = select(Todo).where(
+            Todo.id == todo_id,
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        )
+        result = await db.execute(stmt)
+        todo = result.scalar_one_or_none()
         
         if not todo:
             raise HTTPException(status_code=404, detail="Todo not found")
         
-        return _format_todo(todo)
+        return todo
     except HTTPException:
         raise
     except Exception as e:
@@ -102,152 +113,119 @@ async def get_todo(
 
 @router.patch("/{todo_id}", response_model=TodoResponse)
 async def update_todo(
-    todo_id: str,
+    todo_id: int,
     todo_update: TodoUpdate,
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Partially update a todo (only provided fields are updated)"""
     try:
-        if not ObjectId.is_valid(todo_id):
-            raise HTTPException(status_code=400, detail="Invalid todo ID format")
-        
-        todo = await todos_collection.find_one({
-            "_id": ObjectId(todo_id),
-            "user_id": current_user.user_id,
-            "is_deleted": False
-        })
+        stmt = select(Todo).where(
+            Todo.id == todo_id,
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        )
+        result = await db.execute(stmt)
+        todo = result.scalar_one_or_none()
         
         if not todo:
             raise HTTPException(status_code=404, detail="Todo not found")
         
         update_data = todo_update.model_dump(exclude_unset=True)
-        update_data["updated_at"] = datetime.utcnow()
+        for key, value in update_data.items():
+            setattr(todo, key, value)
         
-        await todos_collection.update_one(
-            {"_id": ObjectId(todo_id)},
-            {"$set": update_data}
-        )
+        await db.commit()
+        await db.refresh(todo)
         
-        updated_todo = await todos_collection.find_one({"_id": ObjectId(todo_id)})
-        return _format_todo(updated_todo)
+        return todo
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Error updating todo: {str(e)}")
 
 @router.delete("/{todo_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_todo(
-    todo_id: str,
-    current_user: TokenData = Depends(get_current_user)
+    todo_id: int,
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Soft delete a todo (marks as deleted instead of removing)"""
     try:
-        if not ObjectId.is_valid(todo_id):
-            raise HTTPException(status_code=400, detail="Invalid todo ID format")
-        
-        result = await todos_collection.update_one(
-            {
-                "_id": ObjectId(todo_id),
-                "user_id": current_user.user_id,
-                "is_deleted": False
-            },
-            {
-                "$set": {
-                    "is_deleted": True,
-                    "updated_at": datetime.utcnow()
-                }
-            }
+        stmt = select(Todo).where(
+            Todo.id == todo_id,
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
         )
+        result = await db.execute(stmt)
+        todo = result.scalar_one_or_none()
         
-        if result.matched_count == 0:
+        if not todo:
             raise HTTPException(status_code=404, detail="Todo not found")
+        
+        todo.is_deleted = True
+        await db.commit()
         
         return None
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Error deleting todo: {str(e)}")
 
 @router.post("/{todo_id}/complete", response_model=TodoResponse)
 async def complete_todo(
-    todo_id: str,
-    current_user: TokenData = Depends(get_current_user)
+    todo_id: int,
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Mark a todo as completed"""
     try:
-        if not ObjectId.is_valid(todo_id):
-            raise HTTPException(status_code=400, detail="Invalid todo ID format")
-        
-        todo = await todos_collection.find_one({
-            "_id": ObjectId(todo_id),
-            "user_id": current_user.user_id,
-            "is_deleted": False
-        })
+        stmt = select(Todo).where(
+            Todo.id == todo_id,
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        )
+        result = await db.execute(stmt)
+        todo = result.scalar_one_or_none()
         
         if not todo:
             raise HTTPException(status_code=404, detail="Todo not found")
         
-        await todos_collection.update_one(
-            {"_id": ObjectId(todo_id)},
-            {
-                "$set": {
-                    "status": TodoStatus.COMPLETED,
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
+        todo.status = TodoStatus.COMPLETED
+        await db.commit()
+        await db.refresh(todo)
         
-        updated_todo = await todos_collection.find_one({"_id": ObjectId(todo_id)})
-        return _format_todo(updated_todo)
+        return todo
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Error completing todo: {str(e)}")
 
 @router.get("/stats/summary", response_model=dict)
 async def get_todo_stats(
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Get statistics about user's todos"""
     try:
-        pipeline = [
-            {
-                "$match": {
-                    "user_id": current_user.user_id,
-                    "is_deleted": False
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$status",
-                    "count": {"$sum": 1}
-                }
-            }
-        ]
+        stmt = select(Todo.status, func.count(Todo.id)).where(
+            Todo.user_id == int(current_user.user_id),
+            Todo.is_deleted == False
+        ).group_by(Todo.status)
         
-        stats = await todos_collection.aggregate(pipeline).to_list(None)
+        result = await db.execute(stmt)
+        stats = result.all()
         
         summary = {
-            "total": sum(s["count"] for s in stats),
-            "pending": next((s["count"] for s in stats if s["_id"] == "pending"), 0),
-            "in_progress": next((s["count"] for s in stats if s["_id"] == "in_progress"), 0),
-            "completed": next((s["count"] for s in stats if s["_id"] == "completed"), 0)
+            "total": sum(count for _, count in stats),
+            "pending": next((count for status, count in stats if status == TodoStatus.PENDING), 0),
+            "in_progress": next((count for status, count in stats if status == TodoStatus.IN_PROGRESS), 0),
+            "completed": next((count for status, count in stats if status == TodoStatus.COMPLETED), 0)
         }
         
         return summary
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching stats: {str(e)}")
-
-def _format_todo(todo: dict) -> TodoResponse:
-    """Helper function to format MongoDB document to TodoResponse"""
-    return TodoResponse(
-        id=str(todo["_id"]),
-        user_id=todo["user_id"],
-        title=todo["title"],
-        description=todo.get("description"),
-        status=todo["status"],
-        priority=todo["priority"],
-        created_at=todo["created_at"],
-        updated_at=todo["updated_at"],
-        is_deleted=todo.get("is_deleted", False)
-    )

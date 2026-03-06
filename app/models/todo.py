@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 from enum import Enum
 
@@ -21,8 +21,8 @@ class TodoUpdate(BaseModel):
     priority: Optional[int] = Field(None, ge=1, le=5)
 
 class TodoResponse(BaseModel):
-    id: str
-    user_id: str
+    id: Union[int, str]
+    user_id: Union[int, str]
     title: str
     description: Optional[str]
     status: TodoStatus
@@ -30,6 +30,9 @@ class TodoResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     is_deleted: bool = False
+    
+    class Config:
+        from_attributes = True
 
 class TodoListResponse(BaseModel):
     total: int
